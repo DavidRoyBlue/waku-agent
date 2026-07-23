@@ -302,7 +302,7 @@ def test_autodetects_subscription_when_no_key_and_sdk_installed(fake_sdk, monkey
     assert settings.provider == "claude-code"
 
 
-def test_no_autodetect_when_a_key_or_explicit_provider_exists(fake_sdk, monkeypatch):
+def test_no_autodetect_when_a_key_is_set(fake_sdk, monkeypatch):
     import anthropic
     from waku.config import Settings
     from waku.loop.models import get_client
@@ -315,19 +315,29 @@ def test_no_autodetect_when_a_key_or_explicit_provider_exists(fake_sdk, monkeypa
     assert isinstance(get_client(settings), anthropic.Anthropic)
     assert settings.provider == "anthropic"
 
-    # an explicit WAKU_PROVIDER=anthropic without a key -> still exits, no reroute
+
+def test_autodetect_rescues_the_env_template_pin(fake_sdk, monkeypatch):
+    """Live regression: .env.example ships WAKU_PROVIDER=anthropic ACTIVE, so
+    cp .env.example .env pins the provider explicitly. With no key anywhere
+    that is a guaranteed dead end — the reroute must fire even then."""
+    from waku.config import Settings
+    from waku.loop.models import get_client
+    from waku.loop.sdk_agent import ClaudeAgentClient
+
     monkeypatch.setenv("WAKU_PROVIDER", "anthropic")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     settings = Settings(provider="anthropic", model="", small_model="",
                         api_key="", base_url=None)
-    with pytest.raises(SystemExit, match="ANTHROPIC_API_KEY"):
-        get_client(settings)
+    assert isinstance(get_client(settings), ClaudeAgentClient)
+    assert settings.provider == "claude-code"
 
 
 def test_missing_anthropic_key_error_mentions_the_subscription_path(monkeypatch):
     from waku.config import Settings
     from waku.loop.models import get_client
 
+    # no SDK -> no reroute possible; the error must point at the keyless path
+    monkeypatch.setattr("waku.loop.models.sdk_ready", lambda: False)
     monkeypatch.setenv("WAKU_PROVIDER", "anthropic")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     settings = Settings(provider="anthropic", model="", small_model="",
