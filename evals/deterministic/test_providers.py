@@ -19,7 +19,8 @@ from waku.loop.models import PROVIDERS, OpenAICompatClient, get_client
 @pytest.fixture(autouse=True)
 def fake_keys(monkeypatch):
     for provider in PROVIDERS.values():
-        monkeypatch.setenv(provider.key_env, "fake-key-for-tests")
+        if provider.key_env:                        # claude-code has no key env
+            monkeypatch.setenv(provider.key_env, "fake-key-for-tests")
     # a stray custom-endpoint override must not leak into these checks
     monkeypatch.delenv("WAKU_API_KEY", raising=False)
     monkeypatch.delenv("WAKU_BASE_URL", raising=False)
@@ -28,6 +29,8 @@ def fake_keys(monkeypatch):
 @pytest.mark.parametrize("name", list(PROVIDERS))
 def test_get_client_builds_the_right_wire(name):
     provider = PROVIDERS[name]
+    if provider.kind == "sdk":
+        pytest.skip("subscription provider — covered offline in test_sdk_agent.py")
     settings = Settings(provider=name, model="", small_model="", api_key="", base_url=None)
     client = get_client(settings)
     expected = anthropic.Anthropic if provider.kind == "anthropic" else OpenAICompatClient
@@ -39,6 +42,11 @@ def test_get_client_builds_the_right_wire(name):
 
 @pytest.mark.parametrize("name", list(PROVIDERS))
 def test_missing_key_exits_with_the_key_name(name, monkeypatch):
+    if not PROVIDERS[name].key_env:
+        pytest.skip("subscription provider — no key to miss")
+    # pin the provider explicitly: with the real SDK installed, the keyless
+    # autodetect would otherwise reroute the anthropic case to claude-code
+    monkeypatch.setenv("WAKU_PROVIDER", name)
     monkeypatch.delenv(PROVIDERS[name].key_env, raising=False)
     settings = Settings(provider=name, model="", small_model="", api_key="", base_url=None)
     with pytest.raises(SystemExit, match=PROVIDERS[name].key_env):

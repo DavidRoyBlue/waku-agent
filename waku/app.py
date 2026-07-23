@@ -9,7 +9,7 @@ from __future__ import annotations
 from waku.config import Settings, load_settings
 from waku.db import connect
 from waku.loop.agent import LoopResult, Observer, run_loop
-from waku.loop.models import get_client
+from waku.loop.models import PROVIDERS, get_client
 from waku.ops.tracing import Tracer, compose
 from waku.runtime.session import Session
 from waku.tools import build_registry
@@ -32,6 +32,17 @@ class Waku:
         self.mcp_bridge = getattr(self.tools, "mcp_bridge", None)
         self.session = Session(self.settings, memory=self.memory)
         self.tracer = Tracer(self.settings)
+
+        # Two loops, one contract: our own while-loop (agent.py) for API
+        # providers, the Agent SDK's managed loop for the subscription
+        # provider. Same signature, same LoopResult, same observer events.
+        provider = PROVIDERS.get(self.settings.provider)
+        if provider is not None and provider.kind == "sdk":
+            from waku.loop.sdk_agent import run_sdk_loop
+
+            self._run_loop = run_sdk_loop
+        else:
+            self._run_loop = run_loop
 
     def close(self) -> None:
         """Release external resources (MCP subprocesses). Called when the
@@ -66,7 +77,7 @@ class Waku:
             window = self.settings.history_turns * 2
             messages = self.session.history[-window:] + [{"role": "user", "content": user_message}]
 
-            result = run_loop(
+            result = self._run_loop(
                 client=self.client,
                 model=self.settings.model,
                 system=system,

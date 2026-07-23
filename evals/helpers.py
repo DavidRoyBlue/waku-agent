@@ -10,13 +10,15 @@ from types import SimpleNamespace
 def _has_key() -> bool:
     """True when the ACTIVE provider (WAKU_PROVIDER) has its key set, so live
     evals run on whatever the user actually configured (anthropic, openrouter,
-    gemini, ...), not only on ANTHROPIC_API_KEY."""
+    gemini, ...), not only on ANTHROPIC_API_KEY. The subscription provider
+    (kind "sdk") counts as keyed when the Agent SDK is installed."""
     from waku.config import load_settings
-    from waku.loop.models import PROVIDERS
+    from waku.loop.models import PROVIDERS, sdk_ready
 
     settings = load_settings()
     provider = PROVIDERS.get(settings.provider)
-    return bool(settings.api_key or (provider and os.getenv(provider.key_env)))
+    return bool(settings.api_key or (provider and (
+        (provider.kind == "sdk" and sdk_ready()) or os.getenv(provider.key_env))))
 
 
 HAS_KEY = _has_key()
