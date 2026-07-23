@@ -4,7 +4,7 @@
 
 **Goal:** Add a `claude-code` provider that runs Waku on a Claude Max/Pro subscription via the Claude Agent SDK (no API key), keeping the LoopResult/observer contract so tracing, dashboard, and evals keep working.
 
-**Architecture:** Approach B — a second, honest loop. New `waku/loop/sdk_agent.py` exposes `run_sdk_loop(...)` (same signature and `LoopResult` contract as `waku/loop/agent.py:run_loop`) which hands the whole turn to the Agent SDK: Waku's tools become in-process MCP tools, built-in Claude Code tools are disabled, and SDK stream messages are translated into the same observer events (`text`, `tool`, `llm`). `app.py` branches once on provider kind. Memory's small-model calls (retrieval gate + consolidation) go through a thin `ClaudeAgentClient` whose `messages.create` is a one-shot SDK query — the whole app runs keyless.
+**Architecture:** Approach B — a second, honest loop. New `waku/loop/sdk_agent.py` exposes `run_sdk_loop(...)` (same signature and `LoopResult` contract as `waku/loop/agent.py:run_loop`) which hands the whole turn to the Agent SDK: Waku's tools become in-process MCP tools, built-in Claude Code tools are disabled, and SDK stream messages are translated into the same observer events (`text`, `tool`, `llm`). `app.py` branches once on provider kind. Memory's small-model calls (retrieval gate + consolidation) go through a thin `ClaudeAgentClient` whose `messages.create` is a one-shot SDK query — the whole app runs keyless. Seamlessness: installing the `[claude-code]` extra IS the opt-in — with no provider chosen and no key anywhere, `get_client` auto-selects `claude-code` (one stderr note, `WAKU_PROVIDER` overrides), and in claude-code mode a leftover `ANTHROPIC_API_KEY` is actively blanked in the SDK subprocess env so it can never silently bill instead of the subscription.
 
 **Tech Stack:** Python 3.10+, `claude-agent-sdk` (optional extra `[claude-code]`), stdlib asyncio. Tests use a fake `claude_agent_sdk` module injected into `sys.modules` — the deterministic suite never needs the real SDK or a login.
 
@@ -17,7 +17,7 @@
 - Gate before push: `make gate` must pass.
 - Commit each task when its tests pass. Branch: `worktree-agent-sdk-provider` (already checked out). Never push to main.
 - Honest limitations, documented not hidden: `WAKU_MAX_TOKENS` is not enforceable through the SDK (no per-call output cap); streaming is per-message chunks, not per-token; `max_iterations` maps to SDK `max_turns`.
-- SDK facts (verified 2026-07-23): package `claude-agent-sdk`; subscription auth is used when `ANTHROPIC_API_KEY` is unset and Claude Code is logged in (`claude login`); `ClaudeAgentOptions(tools=[])` disables all built-ins; custom tools via `@tool(name, description, schema)` + `create_sdk_mcp_server(name=, version=, tools=)`, allow-listed as `mcp__<server>__<tool>`; `permission_mode="dontAsk"` never prompts and denies unlisted tools; stream yields `AssistantMessage` (with `TextBlock`/`ToolUseBlock`) then `ResultMessage` with `.result`, `.subtype` ("success", "error_max_turns", ...), `.num_turns`, `.usage` (input_tokens/output_tokens, may be dict or object), `.session_id`; tool handlers are `async def handler(args: dict) -> {"content": [{"type": "text", "text": ...}]}`.
+- SDK facts (verified 2026-07-23, re-verified by independent doc review): package `claude-agent-sdk` — it does NOT bundle a CLI: Claude Code must be installed separately and signed in ONCE PER MACHINE (`claude login`); subscription auth is used when the SDK subprocess sees no `ANTHROPIC_API_KEY`; `ClaudeAgentOptions.env` MERGES over the inherited environment (override only, no unset — an empty-string key is treated as "no key" by Claude Code today; undocumented but tested behavior, pinned by our tests so a change fails loudly); `ClaudeAgentOptions(tools=[])` disables all built-ins; custom tools via `@tool(name, description, schema)` (full JSON Schema dicts accepted) + `create_sdk_mcp_server(name=, version=, tools=)`, allow-listed as `mcp__<server>__<tool>`; `permission_mode="dontAsk"` never prompts and denies unlisted tools; stream yields `AssistantMessage` (with `TextBlock`/`ToolUseBlock`) then `ResultMessage` with `.result`, `.subtype` ("success", "error_max_turns", ...), `.num_turns`, `.usage` (a dict of input_tokens/output_tokens; our helper also tolerates objects), `.session_id`; tool handlers are `async def handler(args: dict) -> {"content": [{"type": "text", "text": ...}]}`. Every `query()` starts a fresh SDK session, so each call — including the retrieval gate's one-shot — pays a noticeable startup cost; documented, not hidden.
 
 ---
 
@@ -42,6 +42,7 @@ stays keyless and offline, like every other provider test."""
 
 from __future__ import annotations
 
+import importlib.machinery
 import sys
 import types
 
@@ -117,7 +118,8 @@ Honest differences from agent.py:
     starts a fresh SDK session, so the retrieval gate's injections still land).
 
 All claude_agent_sdk imports are lazy so core Waku runs without the extra:
-pip install -e '.[claude-code]' to enable, then `claude login` once.
+uv pip install -e '.[claude-code]' to enable (needs Claude Code installed and
+signed in — `claude login`, once per machine).
 """
 
 from __future__ import annotations
@@ -206,6 +208,9 @@ def fake_sdk(monkeypatch):
     the stub invokes the matching registered MCP tool handler, like the real
     SDK's inner loop does."""
     mod = types.ModuleType("claude_agent_sdk")
+    # a real ModuleSpec so importlib.util.find_spec() works on the stub —
+    # a bare ModuleType has __spec__=None, which find_spec raises ValueError on
+    mod.__spec__ = importlib.machinery.ModuleSpec("claude_agent_sdk", None)
 
     class TextBlock:
         def __init__(self, text):
@@ -275,6 +280,9 @@ def test_client_create_returns_anthropic_shape(fake_sdk):
     assert fake_sdk.last_options.tools == []
     assert fake_sdk.last_options.max_turns == 1
     assert fake_sdk.last_prompt == "gate this"
+    # a leftover ANTHROPIC_API_KEY must be blanked for the SDK subprocess —
+    # claude-code mode always runs on the subscription, never a stray key
+    assert fake_sdk.last_options.env == {"ANTHROPIC_API_KEY": ""}
 
 
 def test_client_has_no_stream_attribute(fake_sdk):
@@ -305,7 +313,11 @@ class ClaudeAgentClient:
                 system: str | None = None, tools: list | None = None):
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
-        kwargs: dict[str, Any] = {"model": model, "tools": [], "max_turns": 1}
+        # env merges over the inherited environment; blanking the key makes the
+        # SDK subprocess see "no key" and use the subscription — a leftover
+        # ANTHROPIC_API_KEY can never silently bill (behavior pinned by test).
+        kwargs: dict[str, Any] = {"model": model, "tools": [], "max_turns": 1,
+                                  "env": {"ANTHROPIC_API_KEY": ""}}
         if system:
             kwargs["system_prompt"] = system
         options = ClaudeAgentOptions(**kwargs)
@@ -427,6 +439,7 @@ def test_run_sdk_loop_locks_down_builtins_and_allows_only_waku_tools(fake_sdk):
     assert options.permission_mode == "dontAsk"
     assert options.max_turns == 5
     assert options.system_prompt == "s"
+    assert options.env == {"ANTHROPIC_API_KEY": ""}   # subscription, never a stray key
 
 
 def test_run_sdk_loop_streams_text_deltas_only_when_asked(fake_sdk):
@@ -527,6 +540,9 @@ def run_sdk_loop(
         allowed_tools=[f"mcp__waku__{s['name']}" for s in schemas],
         permission_mode="dontAsk",         # never prompt; deny anything not listed
         max_turns=max_iterations,
+        # explicit claude-code choice means "my subscription" — blank any stray
+        # key so the SDK subprocess can never bill it (see module docstring)
+        env={"ANTHROPIC_API_KEY": ""},
     )
 
     async def run() -> None:
@@ -627,6 +643,65 @@ def test_get_client_without_sdk_says_how_to_install(monkeypatch):
                         api_key="", base_url=None)
     with pytest.raises(SystemExit, match=r"claude-code.*claude login"):
         get_client(settings)
+
+
+def test_autodetects_subscription_when_no_key_and_sdk_installed(fake_sdk, monkeypatch):
+    """Installing the extra IS the opt-in: default provider + no key anywhere
+    + SDK importable -> claude-code, with a stderr note."""
+    from waku.config import Settings
+    from waku.loop.models import get_client
+    from waku.loop.sdk_agent import ClaudeAgentClient
+
+    monkeypatch.delenv("WAKU_PROVIDER", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings = Settings(provider="anthropic", model="", small_model="",
+                        api_key="", base_url=None)
+    assert isinstance(get_client(settings), ClaudeAgentClient)
+    assert settings.provider == "claude-code"
+
+
+def test_no_autodetect_when_a_key_or_explicit_provider_exists(fake_sdk, monkeypatch):
+    import anthropic
+    from waku.config import Settings
+    from waku.loop.models import get_client
+
+    # a key present -> the API path is untouched
+    monkeypatch.delenv("WAKU_PROVIDER", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-for-tests")
+    settings = Settings(provider="anthropic", model="", small_model="",
+                        api_key="", base_url=None)
+    assert isinstance(get_client(settings), anthropic.Anthropic)
+    assert settings.provider == "anthropic"
+
+    # an explicit WAKU_PROVIDER=anthropic without a key -> still exits, no reroute
+    monkeypatch.setenv("WAKU_PROVIDER", "anthropic")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings = Settings(provider="anthropic", model="", small_model="",
+                        api_key="", base_url=None)
+    with pytest.raises(SystemExit, match="ANTHROPIC_API_KEY"):
+        get_client(settings)
+
+
+def test_missing_anthropic_key_error_mentions_the_subscription_path(monkeypatch):
+    from waku.config import Settings
+    from waku.loop.models import get_client
+
+    monkeypatch.setenv("WAKU_PROVIDER", "anthropic")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings = Settings(provider="anthropic", model="", small_model="",
+                        api_key="", base_url=None)
+    with pytest.raises(SystemExit, match=r"claude-code"):
+        get_client(settings)
+
+
+def test_price_for_subscription_is_zero():
+    """price_for must short-circuit BEFORE the per-model rate table — the
+    default claude models all exist in MODEL_PRICING, and subscription turns
+    must never show dollar spend in the arena or the usage ledger."""
+    from waku.ops.dashboard import price_for
+
+    assert price_for("claude-code", "claude-sonnet-5") == (0.0, 0.0)
+    assert price_for("claude-code", "claude-opus-4-8") == (0.0, 0.0)
 ```
 
 Update `evals/deterministic/test_providers.py` — three edits so the keyless provider doesn't break the table checks:
@@ -648,16 +723,19 @@ Update `evals/deterministic/test_providers.py` — three edits so the keyless pr
 # at the top of test_missing_key_exits_with_the_key_name (after line 41):
     if not PROVIDERS[name].key_env:
         pytest.skip("subscription provider — no key to miss")
+    # pin the provider explicitly: with the real SDK installed, the keyless
+    # autodetect would otherwise reroute the anthropic case to claude-code
+    monkeypatch.setenv("WAKU_PROVIDER", name)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest evals/deterministic/test_sdk_agent.py evals/deterministic/test_providers.py -v`
-Expected: the three new tests FAIL with `KeyError: 'claude-code'`; existing provider tests still pass.
+Expected: the new tests FAIL — `KeyError: 'claude-code'` for the registration/client ones, no autodetect reroute, no price short-circuit; existing provider tests still pass.
 
 - [ ] **Step 3: Write the implementation**
 
-In `waku/loop/models.py`, add `import sys` to the imports header if absent. Add to `PROVIDERS` (after the `"anthropic"` entry, keeping the Claude entries together):
+In `waku/loop/models.py`, add `import sys` and `import importlib.util` to the imports header if absent. Add to `PROVIDERS` (after the `"anthropic"` entry, keeping the Claude entries together):
 
 ```python
     # Not an API at all: the Claude Agent SDK runs the turn under your Claude
@@ -668,7 +746,34 @@ In `waku/loop/models.py`, add `import sys` to the imports header if absent. Add 
                             flagship="claude-opus-4-8", fast="claude-sonnet-5"),
 ```
 
-In `get_client` (waku/loop/models.py:101), insert after the unknown-provider check and BEFORE the api_key lookup:
+After the `PROVIDERS` dict, add the shared readiness probe (the dashboard and eval gates import this too — keep it here, not in ops, so nothing UI-flavored leaks into the loop layer):
+
+```python
+def sdk_ready() -> bool:
+    """Is the claude-agent-sdk extra importable? Shared by get_client, the
+    dashboard, and the eval gates. find_spec raises ValueError on modules
+    whose __spec__ is None (test stubs) — those ARE importable, count them."""
+    try:
+        return importlib.util.find_spec("claude_agent_sdk") is not None
+    except ValueError:
+        return True
+```
+
+In `get_client` (waku/loop/models.py:101), add at the very top, BEFORE the `PROVIDERS.get` lookup:
+
+```python
+    # Zero-config subscription: installing the [claude-code] extra IS the
+    # opt-in. Default provider, no key anywhere, SDK present -> use it.
+    if (settings.provider == "anthropic" and not os.getenv("WAKU_PROVIDER")
+            and not (settings.api_key or os.getenv("ANTHROPIC_API_KEY"))
+            and sdk_ready()):
+        print("note: no API key found but the Claude Agent SDK is installed — "
+              "running on your Claude subscription (provider claude-code). "
+              "Set WAKU_PROVIDER to choose explicitly.", file=sys.stderr)
+        settings.provider = "claude-code"
+```
+
+Then insert after the unknown-provider check and BEFORE the api_key lookup:
 
 ```python
     if provider.kind == "sdk":
@@ -679,22 +784,46 @@ In `get_client` (waku/loop/models.py:101), insert after the unknown-provider che
         except ImportError:
             raise SystemExit(
                 "Provider 'claude-code' runs on the Claude Agent SDK: "
-                "pip install -e '.[claude-code]', then log in once with "
-                "`claude login`. It uses your Claude subscription — no API key."
+                "uv pip install -e '.[claude-code]', install Claude Code, and "
+                "sign in once with `claude login`. It uses your Claude "
+                "subscription — no API key."
             )
         if os.getenv("ANTHROPIC_API_KEY"):
-            print("note: ANTHROPIC_API_KEY is set, so the Agent SDK will bill that "
-                  "key instead of your subscription. Unset it to use the subscription.",
+            print("note: ANTHROPIC_API_KEY is set but IGNORED in claude-code "
+                  "mode — this provider always runs on your Claude subscription.",
                   file=sys.stderr)
         from waku.loop.sdk_agent import ClaudeAgentClient
 
         return ClaudeAgentClient()
 ```
 
+Change the existing no-key `SystemExit` (waku/loop/models.py:112-116) so a subscription user stuck at the missing-key moment learns the keyless path exists:
+
+```python
+    if not api_key:
+        hint = ("\nHave a Claude subscription instead? uv pip install -e "
+                "'.[claude-code]' and it just works — no key needed."
+                if settings.provider == "anthropic" else "")
+        raise SystemExit(
+            f"No API key for provider '{settings.provider}'. "
+            f"Set {provider.key_env} in .env (see .env.example).{hint}"
+        )
+```
+
 In `waku/ops/dashboard.py`, add to the `PRICING` dict:
 
 ```python
     "claude-code": (0.0, 0.0),   # subscription-covered — no per-token bill
+```
+
+and short-circuit `price_for` (find with `grep -n "def price_for" waku/ops/dashboard.py`) BEFORE its `MODEL_PRICING` lookup — the claude-code default models all exist in `MODEL_PRICING`, so without this the arena cost column and the usage.jsonl spend ledger would show API-rate dollars for subscription-covered tokens:
+
+```python
+    from waku.loop.models import PROVIDERS
+
+    prov = PROVIDERS.get(provider)
+    if prov is not None and prov.kind == "sdk":
+        return (0.0, 0.0)   # subscription-covered — per-model API rates don't apply
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -706,13 +835,15 @@ Expected: ALL PASS (including `test_dashboard_pricing_covers_every_provider[clau
 
 ```bash
 git add waku/loop/models.py waku/ops/dashboard.py evals/deterministic/test_sdk_agent.py evals/deterministic/test_providers.py
-git commit -m "feat: register the claude-code subscription provider
+git commit -m "feat: register the claude-code subscription provider, zero-config
 
 New PROVIDERS entry with kind 'sdk' and an empty key_env: get_client routes
-it to ClaudeAgentClient before any key check, with a fixable SystemExit when
-the extra isn't installed and a stderr note when ANTHROPIC_API_KEY would
-shadow the subscription. Provider-table checks updated for a keyless entry;
-PRICING carries it at (0,0) — subscription-covered."
+it to ClaudeAgentClient before any key check, autodetects it when the extra
+is installed and no key exists anywhere (installing the extra IS the opt-in),
+and appends the keyless path to the anthropic missing-key error. A stray
+ANTHROPIC_API_KEY is noted-and-ignored, never billed. price_for
+short-circuits kind 'sdk' to (0,0) BEFORE the per-model table so the arena
+and the spend ledger never invent API-rate dollars for subscription tokens."
 ```
 
 ---
@@ -796,16 +927,19 @@ the LoopResult/observer contract makes the two interchangeable."
 
 ---
 
-### Task 6: Dashboard — keyless provider in Settings (backend + frontend)
+### Task 6: Dashboard + ops — keyless provider everywhere
 
 **Files:**
 - Modify: `waku/ops/dashboard.py` (`default_pinned_specs` line 1260-1270; `settings_info` line 1318-1368; `apply_settings` line 1388-1390)
-- Modify: `waku/ops/static/js/views.js` (line 273-276)
+- Modify: `waku/ops/static/js/views.js` (line 271-276)
+- Modify: `evals/deterministic/test_pinned_models.py` (its env-preparing autouse fixture)
+- Modify: `waku/ops/release_gate.py` (~line 76) and `evals/helpers.py` (~line 19) — the judge/live-eval "has key" checks
+- Modify: `waku/ops/judge.py` (~line 90)
 - Test: `evals/deterministic/test_sdk_agent.py` (append)
 
 **Interfaces:**
-- Consumes: `PROVIDERS["claude-code"].kind == "sdk"`, empty `key_env`.
-- Produces: `settings_info()["providers"]` entries gain `"subscription": bool`; for the sdk provider `key_set` means "SDK installed" (`importlib.util.find_spec("claude_agent_sdk") is not None`). `apply_settings` writable set skips empty key envs. `default_pinned_specs` includes claude-code when the SDK is installed.
+- Consumes: `PROVIDERS["claude-code"].kind == "sdk"`, empty `key_env`, `sdk_ready()` from Task 4 (`waku.loop.models`).
+- Produces: `settings_info()["providers"]` entries gain `"subscription": bool`; for the sdk provider `key_set` means "SDK installed". `apply_settings` writable set skips empty key envs. `default_pinned_specs` includes claude-code when the SDK is installed. Release gate and `HAS_KEY`-gated live evals treat "sdk provider + SDK installed" as having a key, so `make gate` under `WAKU_PROVIDER=claude-code` runs the judge suite instead of silently skipping it.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -841,38 +975,35 @@ Expected: FAIL (`KeyError: 'subscription'`; missing specs)
 
 In `waku/ops/dashboard.py`:
 
-`default_pinned_specs` (line 1267-1269) — replace the loop body:
+`default_pinned_specs` (line 1267-1269) — replace the loop body (import `sdk_ready` alongside `PROVIDERS` from `waku.loop.models` in this function; alias it locally so tests can monkeypatch the models attribute):
 
 ```python
-    import importlib.util
+    from waku.loop.models import PROVIDERS, sdk_ready
 
-    sdk_ready = importlib.util.find_spec("claude_agent_sdk") is not None
     for name, prov in PROVIDERS.items():
-        usable = sdk_ready if prov.kind == "sdk" else bool(os.getenv(prov.key_env))
+        usable = sdk_ready() if prov.kind == "sdk" else bool(os.getenv(prov.key_env))
         if usable:
             specs += [f"{name}:{m}" for m in prov.default_pair()]
 ```
 
-`settings_info` providers list (line 1351-1357) — replace with:
+`settings_info` (line 1322) — extend the import to `from waku.loop.models import PROVIDERS, sdk_ready`, compute once after `s = load_settings()`:
+
+```python
+    sdk_installed = sdk_ready()
+```
+
+then replace the providers list (line 1351-1357) with:
 
 ```python
         "providers": [
             {"name": name, "key_env": p.key_env,
              # for the subscription provider, "key_set" means "SDK installed"
-             "key_set": (sdk_ready if p.kind == "sdk" else bool(os.getenv(p.key_env))),
+             "key_set": (sdk_installed if p.kind == "sdk" else bool(os.getenv(p.key_env))),
              "key_last4": (os.getenv(p.key_env) or "")[-4:] if p.key_env else "",
              "subscription": p.kind == "sdk",
              "default_model": p.model, "default_small_model": p.small_model}
             for name, p in PROVIDERS.items()
         ],
-```
-
-and near the top of `settings_info` (after `s = load_settings()`, line 1324):
-
-```python
-    import importlib.util
-
-    sdk_ready = importlib.util.find_spec("claude_agent_sdk") is not None
 ```
 
 `apply_settings` writable set (line 1390) — change the union term to skip empty names:
@@ -881,13 +1012,43 @@ and near the top of `settings_info` (after `s = load_settings()`, line 1324):
                 | {p.key_env for p in PROVIDERS.values() if p.key_env})
 ```
 
-In `waku/ops/static/js/views.js` line 273-276, wrap the per-provider field so subscription providers show a status line instead of a password input:
+In `evals/deterministic/test_pinned_models.py`, find the autouse fixture that prepares the environment (search `def home` / the fixture clearing provider keys) and add one line inside it — three of its tests assert exact pin lists (`pinned == []`, the 4-row defaults, `== ["kimi-k3"]`) and would fail on any machine where the real `claude-agent-sdk` is installed:
+
+```python
+    # keyless subscription provider must not leak default pins into these
+    # exact-equality checks on machines that have the SDK extra installed
+    monkeypatch.setattr("waku.loop.models.sdk_ready", lambda: False)
+```
+
+In `waku/ops/release_gate.py` (~line 76) and `evals/helpers.py` (~line 19), find the `os.getenv(provider.key_env)` "has key" checks (grep `key_env` in both) and extend each so the subscription provider counts as keyed when usable — judge evals must RUN under claude-code, not silently skip:
+
+```python
+    from waku.loop.models import sdk_ready
+
+    has_key = (provider.kind == "sdk" and sdk_ready()) or bool(os.getenv(provider.key_env))
+```
+
+(adapt the variable name to each call site; the expression is the change).
+
+In `waku/ops/judge.py` line 90, widen the retry loop's catch so a keyless/SDK-less judge pick fails the grade visibly instead of hanging the Compare column's SSE stream (`get_client` raises `SystemExit`, which `except Exception` misses):
+
+```python
+        except (Exception, SystemExit) as exc:
+```
+
+In `waku/ops/static/js/views.js` line 271, the collapsible summary reads "claude-code key set / key needed" for the current provider — misleading for a keyless one. Make the summary subscription-aware (one ternary; `cur` = `st.providers.find(p=>p.name===st.provider)`):
+
+```javascript
+      <details class="adv" ${st.providers.find(p=>p.name===st.provider)?.key_set?"":"open"}><summary>API keys (${(()=>{const cur=st.providers.find(p=>p.name===st.provider);return cur?.subscription?`${esc(st.provider)} — subscription, ${cur.key_set?"no key needed":"SDK not installed"}`:cur?.key_set?`${esc(st.provider)} key set`:`${esc(st.provider)} key needed`})()})</summary>
+```
+
+Then at line 273-276, wrap the per-provider field so subscription providers show a status line instead of a password input:
 
 ```javascript
       ${st.providers.map(p=>p.subscription
         ?`<label class="fld"><span>${p.name} <span class="meta">Claude subscription — sign in once with "claude login", no key</span>
           ${p.key_set?`<span class="srcpill" style="background:var(--good-soft);color:var(--good)">Agent SDK installed</span>`
-                     :`<span class="srcpill">not installed — pip install -e '.[claude-code]'</span>`}</span></label>`
+                     :`<span class="srcpill">not installed — uv pip install -e '.[claude-code]'</span>`}</span></label>`
         :`<label class="fld"><span>${p.name} key <span class="meta">(${p.key_env})</span>
         ${p.key_set?`<span class="srcpill" style="background:var(--good-soft);color:var(--good)">set ····${esc(p.key_last4)}</span>`
                    :`<span class="srcpill">not set</span>`}</span>
@@ -904,13 +1065,17 @@ Expected: ALL PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add waku/ops/dashboard.py waku/ops/static/js/views.js evals/deterministic/test_sdk_agent.py
-git commit -m "feat: dashboard understands a keyless subscription provider
+git add waku/ops/dashboard.py waku/ops/static/js/views.js waku/ops/release_gate.py waku/ops/judge.py evals/helpers.py evals/deterministic/test_sdk_agent.py evals/deterministic/test_pinned_models.py
+git commit -m "feat: keyless subscription provider across dashboard and ops
 
 settings_info flags claude-code as subscription (key_set = SDK importable),
-the API-keys panel shows install/login status instead of a password field,
-default pins include it when the SDK is present, and the .env whitelist
-skips empty key envs."
+the API-keys panel shows install status instead of a password field, default
+pins include it when the SDK is present, the .env whitelist skips empty key
+envs, the release gate and HAS_KEY live evals treat sdk+installed as keyed
+(judge suite runs under claude-code instead of silently skipping), the
+arena judge catches SystemExit so a keyless pick fails visibly instead of
+hanging the SSE column, and the exact-equality pin tests are shielded from
+machines that have the extra installed."
 ```
 
 ---
@@ -946,29 +1111,35 @@ In the Provider header block, change the provider list line to include `claude-c
 ```
 
 ```bash
-# claude-code → no key. Runs on your Claude subscription via the Agent SDK:
-#   pip install -e '.[claude-code]'   then sign in once:   claude login
-# (If ANTHROPIC_API_KEY is set it bills that key instead — leave it empty.)
+# claude-code → no key. Runs on your Claude subscription via the Agent SDK.
+# Needs Claude Code installed + signed in (once per machine): claude login
+#   uv pip install -e '.[claude-code]'
+# With the extra installed and no key set anywhere, Waku picks this
+# automatically — setting it here just makes the choice explicit.
+# (A set ANTHROPIC_API_KEY is ignored in this mode, never billed.)
 # WAKU_PROVIDER=claude-code
 ```
 
 - [ ] **Step 3: Add a short README subsection**
 
-Next to the existing provider setup prose, add (neutral framing, no ranking):
+Place it directly under the "Use the model you already pay for" paragraph inside the Quickstart (README.md ~line 66-69) — that's where a subscription user is looking within the first 30 seconds; add "claude-code (Claude subscription — no key)" to that paragraph's provider list, and extend the quickstart's `cp .env.example .env` comment with "(Claude subscription: no key — see below)". The subsection (neutral framing, no ranking):
 
 ```markdown
 ### Using a Claude subscription instead of an API key
 
-If you have a Claude Max or Pro subscription, Waku can run through the
-Claude Agent SDK instead of a metered API key:
+If you have a Claude subscription and Claude Code installed, Waku can run
+through the Claude Agent SDK instead of a metered API key:
 
-    pip install -e '.[claude-code]'
-    claude login          # once — signs the Agent SDK into your subscription
-    WAKU_PROVIDER=claude-code make run
+    uv pip install -e '.[claude-code]'
+    claude login          # once per machine, if you haven't already
+    make run              # no key, no .env edit — Waku detects the SDK
 
-In this mode the Agent SDK runs the agent loop (see `waku/loop/sdk_agent.py`
-— a readable counterpart to `waku/loop/agent.py`); Waku's tools, memory,
-tracing, and dashboard all work unchanged. Two honest limitations:
+With the extra installed and no API key configured, Waku selects the
+`claude-code` provider automatically (set `WAKU_PROVIDER` to override). In
+this mode the Agent SDK runs the agent loop (see `waku/loop/sdk_agent.py` —
+a readable counterpart to `waku/loop/agent.py`); Waku's tools, memory,
+tracing, and dashboard all work unchanged, and a leftover
+`ANTHROPIC_API_KEY` is ignored, never billed. Two honest limitations:
 `WAKU_MAX_TOKENS` is not enforced (the SDK has no per-call output cap) and
 streaming arrives in per-message chunks rather than per-token.
 ```
@@ -1008,7 +1179,7 @@ Expected: deterministic gate PASS (judge evals run only if a key is present — 
 - [ ] **Step 3: Live smoke test (only if this machine has Claude Code logged in AND the real SDK installed)**
 
 ```bash
-pip install -e '.[claude-code]' && env -u ANTHROPIC_API_KEY WAKU_PROVIDER=claude-code \
+uv pip install -e '.[claude-code]' && env -u ANTHROPIC_API_KEY WAKU_PROVIDER=claude-code \
   python -c "
 from waku.app import Waku
 from waku.config import load_settings
