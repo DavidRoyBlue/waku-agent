@@ -344,3 +344,19 @@ def test_price_for_subscription_is_zero():
 
     assert price_for("claude-code", "claude-sonnet-5") == (0.0, 0.0)
     assert price_for("claude-code", "claude-opus-4-8") == (0.0, 0.0)
+
+
+def test_waku_dispatches_to_the_sdk_loop(fake_sdk, tmp_path, monkeypatch):
+    from waku.app import Waku
+    from waku.config import Settings
+    from waku.loop.agent import run_loop
+    from waku.loop.sdk_agent import run_sdk_loop
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    sdk_settings = Settings(provider="claude-code", model="", small_model="",
+                            api_key="", base_url=None, home=tmp_path / "sdk")
+    assert Waku(settings=sdk_settings, client=object())._run_loop is run_sdk_loop
+
+    api_settings = Settings(provider="anthropic", model="", small_model="",
+                            api_key="", base_url=None, home=tmp_path / "api")
+    assert Waku(settings=api_settings, client=object())._run_loop is run_loop
