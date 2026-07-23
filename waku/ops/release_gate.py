@@ -69,11 +69,15 @@ def main() -> None:
     # judge needs the ACTIVE provider's key (anthropic, openrouter, ...), same
     # rule as evals/helpers.HAS_KEY
     from waku.config import load_settings
-    from waku.loop.models import PROVIDERS
+    from waku.loop.models import PROVIDERS, sdk_ready
 
     settings = load_settings()
     provider = PROVIDERS.get(settings.provider)
-    if settings.api_key or (provider and os.getenv(provider.key_env)):
+    # the subscription provider counts as keyed when the SDK is installed, so
+    # the judge suite RUNS under claude-code instead of silently skipping
+    has_key = bool(settings.api_key) or bool(provider and (
+        (provider.kind == "sdk" and sdk_ready()) or os.getenv(provider.key_env)))
+    if has_key:
         code, suites["judge"] = run("judge")
         if code:
             report("pass", "fail", suites)

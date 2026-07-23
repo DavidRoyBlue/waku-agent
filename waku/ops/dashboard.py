@@ -1267,11 +1267,12 @@ def default_pinned_specs() -> list[str]:
     """Starter shortlist before the user has curated their own: flagship + fast
     for every provider that has a key set (so the switcher only shows models you
     can actually use). Flagship comes first, so it's that provider's default."""
-    from waku.loop.models import PROVIDERS
+    from waku.loop.models import PROVIDERS, sdk_ready
 
     specs = []
     for name, prov in PROVIDERS.items():
-        if os.getenv(prov.key_env):
+        usable = sdk_ready() if prov.kind == "sdk" else bool(os.getenv(prov.key_env))
+        if usable:
             specs += [f"{name}:{m}" for m in prov.default_pair()]
     return specs
 
@@ -1325,9 +1326,10 @@ def settings_info() -> dict:
     """Current provider/model + which keys are set — masked to last-4, never
     the full key. `pinned` is the user's curated model shortlist (the chat
     switcher shows exactly these, across providers)."""
-    from waku.loop.models import PROVIDERS
+    from waku.loop.models import PROVIDERS, sdk_ready
 
     s = load_settings()
+    sdk_installed = sdk_ready()
     prov = PROVIDERS.get(s.provider)
     # the curated shortlist, in order; the first pinned model per provider is
     # that provider's default (used when you switch providers).
@@ -1356,8 +1358,10 @@ def settings_info() -> dict:
         "custom_key_set": bool(s.api_key),
         "providers": [
             {"name": name, "key_env": p.key_env,
-             "key_set": bool(os.getenv(p.key_env)),
-             "key_last4": (os.getenv(p.key_env) or "")[-4:],
+             # for the subscription provider, "key_set" means "SDK installed"
+             "key_set": (sdk_installed if p.kind == "sdk" else bool(os.getenv(p.key_env))),
+             "key_last4": (os.getenv(p.key_env) or "")[-4:] if p.key_env else "",
+             "subscription": p.kind == "sdk",
              "default_model": p.model, "default_small_model": p.small_model}
             for name, p in PROVIDERS.items()
         ],
@@ -1393,7 +1397,7 @@ def apply_settings(payload: dict) -> dict:
               "small_model": os.getenv("WAKU_SMALL_MODEL", "")}
     writable = ({"WAKU_PROVIDER", "WAKU_MODEL", "WAKU_SMALL_MODEL", "TAVILY_API_KEY",
                  "WAKU_EPISODIC_STORE", "NOTION_TOKEN", "NOTION_EPISODES_DATABASE_ID"}
-                | {p.key_env for p in PROVIDERS.values()})
+                | {p.key_env for p in PROVIDERS.values() if p.key_env})
     env_path = find_dotenv(usecwd=True) or ".env"
 
     updates = {"WAKU_PROVIDER": provider,

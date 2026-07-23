@@ -360,3 +360,23 @@ def test_waku_dispatches_to_the_sdk_loop(fake_sdk, tmp_path, monkeypatch):
     api_settings = Settings(provider="anthropic", model="", small_model="",
                             api_key="", base_url=None, home=tmp_path / "api")
     assert Waku(settings=api_settings, client=object())._run_loop is run_loop
+
+
+def test_settings_info_marks_subscription_provider(fake_sdk, tmp_path, monkeypatch):
+    monkeypatch.setenv("WAKU_HOME", str(tmp_path))
+    from waku.ops.dashboard import settings_info
+
+    rows = {p["name"]: p for p in settings_info()["providers"]}
+    assert rows["claude-code"]["subscription"] is True
+    assert rows["claude-code"]["key_env"] == ""
+    assert rows["claude-code"]["key_set"] is True      # fake SDK is importable
+    assert rows["anthropic"]["subscription"] is False
+
+
+def test_default_pins_include_claude_code_when_sdk_installed(fake_sdk, tmp_path, monkeypatch):
+    monkeypatch.setenv("WAKU_HOME", str(tmp_path))
+    from waku.ops.dashboard import default_pinned_specs
+
+    specs = default_pinned_specs()
+    assert "claude-code:claude-opus-4-8" in specs
+    assert "claude-code:claude-sonnet-5" in specs

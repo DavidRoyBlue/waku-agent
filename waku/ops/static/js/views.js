@@ -268,9 +268,13 @@ const VIEWS = {
       <label class="fld">Gate / summary model (the small model that decides whether a message needs memory, and distills chats into facts; pick something cheap and terse) <input id="set-small-model" list="model-list" onfocus="markEditing()" placeholder="blank = provider default" value="${st.small_model===st.providers.find(p=>p.name===st.provider)?.default_small_model?"":esc(st.small_model)}"></label>
       <datalist id="model-list"></datalist>
       <div class="meta" id="model-list-msg" style="margin:4px 0 8px"></div></details>${(setTimeout(loadModelList,0),"")}
-      <details class="adv" ${st.providers.find(p=>p.name===st.provider)?.key_set?"":"open"}><summary>API keys (${st.providers.find(p=>p.name===st.provider)?.key_set?`${esc(st.provider)} key set`:`${esc(st.provider)} key needed`})</summary>
+      <details class="adv" ${st.providers.find(p=>p.name===st.provider)?.key_set?"":"open"}><summary>API keys (${(()=>{const cur=st.providers.find(p=>p.name===st.provider);return cur?.subscription?`${esc(st.provider)} — subscription, ${cur.key_set?"no key needed":"SDK not installed"}`:cur?.key_set?`${esc(st.provider)} key set`:`${esc(st.provider)} key needed`})()})</summary>
       <div class="meta" style="margin:10px 0 4px">Keys stay in your local <code>.env</code> — never sent back to this page (only a set/not-set status and the last 4 digits). Leave a field blank to keep the current key.</div>
-      ${st.providers.map(p=>`<label class="fld"><span>${p.name} key <span class="meta">(${p.key_env})</span>
+      ${st.providers.map(p=>p.subscription
+        ?`<label class="fld"><span>${p.name} <span class="meta">Claude subscription — sign in once with "claude login", no key</span>
+          ${p.key_set?`<span class="srcpill" style="background:var(--good-soft);color:var(--good)">Agent SDK installed</span>`
+                     :`<span class="srcpill">not installed — uv pip install -e '.[claude-code]'</span>`}</span></label>`
+        :`<label class="fld"><span>${p.name} key <span class="meta">(${p.key_env})</span>
         ${p.key_set?`<span class="srcpill" style="background:var(--good-soft);color:var(--good)">set ····${esc(p.key_last4)}</span>`
                    :`<span class="srcpill apple">not set</span>`}</span>
         <input type="password" data-key="${p.key_env}" placeholder="${p.key_set?"key on file — blank keeps it":"paste key"}"></label>`).join("")}

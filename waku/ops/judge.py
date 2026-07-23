@@ -87,7 +87,9 @@ def judge_reply(task: str, reply: str, provider: str | None = None,
                     model=settings.model, max_tokens=300,
                     messages=[{"role": "user", "content": prompt}])
             break
-        except Exception:
+        except (Exception, SystemExit):
+            # SystemExit too: get_client exits on a keyless/SDK-less pick — the
+            # grade must fail visibly, not hang the Compare column's SSE stream
             if attempt < 3:
                 time.sleep(1.2 * (attempt + 1))   # 1.2s, 2.4s, 3.6s — let a 429 clear
     if resp is None:

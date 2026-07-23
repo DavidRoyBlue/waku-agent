@@ -33,6 +33,9 @@ def home(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("")
     for var in PROVIDER_KEYS:
         monkeypatch.delenv(var, raising=False)
+    # keyless subscription provider must not leak default pins into these
+    # exact-equality checks on machines that have the SDK extra installed
+    monkeypatch.setattr("waku.loop.models.sdk_ready", lambda: False)
     return tmp_path
 
 
