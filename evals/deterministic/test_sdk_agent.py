@@ -144,3 +144,109 @@ def test_client_has_no_stream_attribute(fake_sdk):
     from waku.loop.sdk_agent import ClaudeAgentClient
 
     assert not hasattr(ClaudeAgentClient().messages, "stream")
+
+
+def _registry():
+    from waku.tools.registry import Tool, ToolRegistry
+
+    calls = []
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="save_note", description="Save a note.",
+        input_schema={"type": "object", "properties": {"text": {"type": "string"}},
+                      "required": ["text"]},
+        fn=lambda text: calls.append(text) or f"Saved: {text}",
+    ))
+    return registry, calls
+
+
+def test_run_sdk_loop_returns_reply_and_usage_events(fake_sdk):
+    from waku.loop.sdk_agent import run_sdk_loop
+
+    registry, _ = _registry()
+    events = []
+    fake_sdk.script = [
+        fake_sdk.AssistantMessage([fake_sdk.TextBlock("On it.")]),
+        fake_sdk.ResultMessage("All set.", num_turns=2),
+    ]
+    result = run_sdk_loop(client=None, model="claude-sonnet-5", system="You are Waku.",
+                          messages=[{"role": "user", "content": "hi"}], tools=registry,
+                          max_iterations=7, observer=lambda kind, ev: events.append((kind, ev)))
+    assert result.reply == "All set."
+    assert result.iterations == 2
+    kinds = [k for k, _ in events]
+    assert "llm" in kinds
+    llm = dict(events)["llm"]
+    assert llm["usage"] == {"in": 10, "out": 4} and llm["stop_reason"] == "success"
+
+
+def test_run_sdk_loop_executes_waku_tools_and_notifies(fake_sdk):
+    from waku.loop.sdk_agent import run_sdk_loop
+
+    registry, calls = _registry()
+    events = []
+    fake_sdk.script = [
+        fake_sdk.ToolUseBlock("save_note", {"text": "milk"}),
+        fake_sdk.ResultMessage("Noted.", num_turns=2),
+    ]
+    result = run_sdk_loop(client=None, model="claude-sonnet-5", system="s",
+                          messages=[{"role": "user", "content": "note milk"}],
+                          tools=registry, observer=lambda k, e: events.append((k, e)))
+    assert calls == ["milk"]                       # the real Waku tool ran
+    assert result.tool_calls == [{"tool": "save_note", "args": {"text": "milk"},
+                                  "output": "Saved: milk"}]
+    assert ("tool", result.tool_calls[0]) in events
+
+
+def test_run_sdk_loop_locks_down_builtins_and_allows_only_waku_tools(fake_sdk):
+    from waku.loop.sdk_agent import run_sdk_loop
+
+    registry, _ = _registry()
+    fake_sdk.script = [fake_sdk.ResultMessage("ok")]
+    run_sdk_loop(client=None, model="m", system="s",
+                 messages=[{"role": "user", "content": "x"}], tools=registry,
+                 max_iterations=5)
+    options = fake_sdk.last_options
+    assert options.tools == []                     # no Bash/Edit/WebSearch/...
+    assert options.allowed_tools == ["mcp__waku__save_note"]
+    assert options.permission_mode == "dontAsk"
+    assert options.max_turns == 5
+    assert options.system_prompt == "s"
+    assert options.env == {"ANTHROPIC_API_KEY": ""}   # subscription, never a stray key
+
+
+def test_run_sdk_loop_streams_text_deltas_only_when_asked(fake_sdk):
+    from waku.loop.sdk_agent import run_sdk_loop
+
+    registry, _ = _registry()
+    fake_sdk.script = [
+        fake_sdk.AssistantMessage([fake_sdk.TextBlock("chunk")]),
+        fake_sdk.ResultMessage("chunk"),
+    ]
+    for stream, expected in ((True, [("text", {"delta": "chunk"})]), (False, [])):
+        events = []
+        run_sdk_loop(client=None, model="m", system="s",
+                     messages=[{"role": "user", "content": "x"}], tools=registry,
+                     observer=lambda k, e: events.append((k, e)), stream=stream)
+        assert [e for e in events if e[0] == "text"] == expected
+
+
+def test_run_sdk_loop_empty_reply_says_how_to_fix(fake_sdk):
+    from waku.loop.sdk_agent import run_sdk_loop
+
+    registry, _ = _registry()
+    fake_sdk.script = [fake_sdk.ResultMessage(None, subtype="error_during_execution")]
+    result = run_sdk_loop(client=None, model="m", system="s",
+                          messages=[{"role": "user", "content": "x"}], tools=registry)
+    assert "claude login" in result.reply
+
+
+def test_run_sdk_loop_max_turns_message_matches_waku_loop(fake_sdk):
+    from waku.loop.sdk_agent import run_sdk_loop
+
+    registry, _ = _registry()
+    fake_sdk.script = [fake_sdk.ResultMessage(None, subtype="error_max_turns", num_turns=3)]
+    result = run_sdk_loop(client=None, model="m", system="s",
+                          messages=[{"role": "user", "content": "x"}], tools=registry,
+                          max_iterations=3)
+    assert "iteration limit" in result.reply

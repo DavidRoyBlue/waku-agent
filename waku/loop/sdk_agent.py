@@ -25,6 +25,9 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+from waku.loop.agent import LoopResult, Observer
+from waku.tools.registry import ToolRegistry
+
 
 def build_prompt(messages: list[dict]) -> str:
     """Waku replays a sliding window of history each turn; the SDK takes one
@@ -95,3 +98,85 @@ class ClaudeAgentClient:
             stop_reason="end_turn",
             usage=SimpleNamespace(input_tokens=tokens_in, output_tokens=tokens_out),
         )
+
+
+def run_sdk_loop(
+    client: Any,                # unused — same signature as agent.run_loop
+    model: str,
+    system: str,
+    messages: list[dict],
+    tools: ToolRegistry,
+    max_iterations: int = 10,
+    max_tokens: int = 2048,     # not enforceable via the SDK — see module docstring
+    observer: Observer | None = None,
+    stream: bool = False,
+) -> LoopResult:
+    """One agent turn, run by the Agent SDK instead of agent.py's while-loop.
+    Waku's tools are served to it as in-process MCP tools; every execution
+    still goes through ToolRegistry.execute, so safety and tracing behave
+    exactly like the home loop."""
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        ResultMessage,
+        TextBlock,
+        create_sdk_mcp_server,
+        query,
+        tool as sdk_tool,
+    )
+
+    notify = observer or (lambda kind, ev: None)
+    result = LoopResult(reply="")
+
+    def to_sdk_tool(schema: dict):
+        name = schema["name"]
+
+        async def handler(args: dict) -> dict:
+            output = tools.execute(name, args)
+            event = {"tool": name, "args": args, "output": output}
+            result.tool_calls.append(event)
+            notify("tool", event)
+            return {"content": [{"type": "text", "text": output}]}
+
+        return sdk_tool(name, schema["description"], schema["input_schema"])(handler)
+
+    schemas = tools.schemas()
+    server = create_sdk_mcp_server(name="waku", version="1.0.0",
+                                   tools=[to_sdk_tool(s) for s in schemas])
+    options = ClaudeAgentOptions(
+        model=model,
+        system_prompt=system,
+        tools=[],                          # no Claude Code built-ins — Waku's tools only
+        mcp_servers={"waku": server},
+        allowed_tools=[f"mcp__waku__{s['name']}" for s in schemas],
+        permission_mode="dontAsk",         # never prompt; deny anything not listed
+        max_turns=max_iterations,
+        # explicit claude-code choice means "my subscription" — blank any stray
+        # key so the SDK subprocess can never bill it (see module docstring)
+        env={"ANTHROPIC_API_KEY": ""},
+    )
+
+    async def run() -> None:
+        async for message in query(prompt=build_prompt(messages), options=options):
+            if isinstance(message, AssistantMessage):
+                if stream:
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and block.text:
+                            notify("text", {"delta": block.text})
+            elif isinstance(message, ResultMessage):
+                result.iterations = message.num_turns or 1
+                if message.result:
+                    result.reply = message.result
+                tokens_in, tokens_out = _tokens(message.usage)
+                notify("llm", {"iteration": result.iterations,
+                               "stop_reason": message.subtype,
+                               "usage": {"in": tokens_in, "out": tokens_out}})
+                if message.subtype == "error_max_turns":
+                    result.reply = ("(I hit my iteration limit before finishing — "
+                                    "try breaking the request into smaller steps.)")
+
+    _run(run())
+    if not result.reply:
+        result.reply = ("(the subscription loop returned no reply — is Claude Code "
+                        "logged in? Run `claude login`.)")
+    return result
