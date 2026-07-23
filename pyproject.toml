@@ -55,6 +55,11 @@ supabase = [
 notion = [
     "notion-client>=2.5",
 ]
+# Optional provider: run Waku on your Claude subscription (Max/Pro) via the
+# Claude Agent SDK — sign in once with `claude login`, no API key needed.
+claude-code = [
+    "claude-agent-sdk>=0.1",
+]
 # Optional: connect MCP servers (.waku/mcp.json)
 mcp = [
     "mcp>=1.0",

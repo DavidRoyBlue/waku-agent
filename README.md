@@ -43,7 +43,7 @@ Built for [Sean's AI Stories](https://www.youtube.com/@SeanAIStories).
 ```bash
 git clone https://github.com/ShenSeanChen/waku-agent && cd waku-agent
 uv venv && uv pip install -e .          # create the env + install the `waku` command
-cp .env.example .env                    # pick a provider, paste ONE key
+cp .env.example .env                    # pick a provider, paste ONE key (Claude subscription: no key — see below)
 uv run waku                             # talk to your Waku in the terminal
 uv run waku dashboard                   # …or the browser cockpit → localhost:7777
 ```
@@ -64,9 +64,28 @@ laptop. Set `TELEGRAM_BOT_TOKEN` and it starts your bot too. (`make dashboard` w
 *"Book a catch-up with Alex on Friday."* → it remembers, and books 9am. Your memory is one
 file: `.waku/state.db`.
 
-**Use the model you already pay for.** Anthropic (default), OpenAI, Gemini, DeepSeek, MiniMax,
-Kimi, GLM, or OpenRouter (one key, hundreds of hosted models) — set `WAKU_PROVIDER=`, paste the key,
-done. One dialect in the loop; a [~60-line adapter](waku/loop/models.py) handles the rest.
+**Use the model you already pay for.** Anthropic (default), claude-code (Claude subscription — no key),
+OpenAI, Gemini, DeepSeek, MiniMax, Kimi, GLM, or OpenRouter (one key, hundreds of hosted models) — set
+`WAKU_PROVIDER=`, paste the key, done. One dialect in the loop; a
+[~60-line adapter](waku/loop/models.py) handles the rest.
+
+### Using a Claude subscription instead of an API key
+
+If you have a Claude subscription and Claude Code installed, Waku can run
+through the Claude Agent SDK instead of a metered API key:
+
+    uv pip install -e '.[claude-code]'
+    claude login          # once per machine, if you haven't already
+    make run              # no key, no .env edit — Waku detects the SDK
+
+With the extra installed and no API key configured, Waku selects the
+`claude-code` provider automatically (set `WAKU_PROVIDER` to override). In
+this mode the Agent SDK runs the agent loop (see `waku/loop/sdk_agent.py` —
+a readable counterpart to `waku/loop/agent.py`); Waku's tools, memory,
+tracing, and dashboard all work unchanged, and a leftover
+`ANTHROPIC_API_KEY` is ignored, never billed. Two honest limitations:
+`WAKU_MAX_TOKENS` is not enforced (the SDK has no per-call output cap) and
+streaming arrives in per-message chunks rather than per-token.
 
 ## Watch the harness run — the dashboard
 
