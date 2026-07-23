@@ -22,6 +22,7 @@ signed in — `claude login`, once per machine).
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -57,3 +58,40 @@ def _run(coro):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(asyncio.run, coro).result()
+
+
+class ClaudeAgentClient:
+    """messages.create() for the memory subsystem (retrieval gate +
+    consolidation): plain one-shot completions over the subscription.
+    The loop itself never uses this — run_sdk_loop talks to the SDK directly."""
+
+    def __init__(self) -> None:
+        self.messages = SimpleNamespace(create=self._create)
+
+    def _create(self, *, model: str, messages: list[dict], max_tokens: int = 1024,
+                system: str | None = None, tools: list | None = None):
+        from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+
+        # env merges over the inherited environment; blanking the key makes the
+        # SDK subprocess see "no key" and use the subscription — a leftover
+        # ANTHROPIC_API_KEY can never silently bill (behavior pinned by test).
+        kwargs: dict[str, Any] = {"model": model, "tools": [], "max_turns": 1,
+                                  "env": {"ANTHROPIC_API_KEY": ""}}
+        if system:
+            kwargs["system_prompt"] = system
+        options = ClaudeAgentOptions(**kwargs)
+
+        async def run() -> tuple[str, Any]:
+            text, usage = "", None
+            async for message in query(prompt=build_prompt(messages), options=options):
+                if isinstance(message, ResultMessage):
+                    text, usage = message.result or "", message.usage
+            return text, usage
+
+        text, usage = _run(run())
+        tokens_in, tokens_out = _tokens(usage)
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=tokens_in, output_tokens=tokens_out),
+        )
