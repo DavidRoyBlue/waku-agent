@@ -120,13 +120,17 @@ def get_client(settings: Settings):
     """Build the client for settings.provider and fill in default model ids.
     Returns anything with .messages.create(...) in the Anthropic shape."""
     # Zero-config subscription: installing the [claude-code] extra IS the
-    # opt-in. Default provider, no key anywhere, SDK present -> use it.
-    if (settings.provider == "anthropic" and not os.getenv("WAKU_PROVIDER")
+    # opt-in. Provider anthropic with no key in sight is a guaranteed dead end
+    # (this includes the .env.example template, which ships WAKU_PROVIDER=
+    # anthropic active — found live: cp .env.example .env pinned the provider
+    # and defeated an unset-only check). With the SDK present, reroute to the
+    # subscription instead of exiting; a pasted key or any other provider wins.
+    if (settings.provider == "anthropic"
             and not (settings.api_key or os.getenv("ANTHROPIC_API_KEY"))
             and sdk_ready()):
-        print("note: no API key found but the Claude Agent SDK is installed — "
-              "running on your Claude subscription (provider claude-code). "
-              "Set WAKU_PROVIDER to choose explicitly.", file=sys.stderr)
+        print("note: no ANTHROPIC_API_KEY found but the Claude Agent SDK is "
+              "installed — running on your Claude subscription (claude-code). "
+              "Paste a key or set WAKU_PROVIDER to override.", file=sys.stderr)
         settings.provider = "claude-code"
 
     provider = PROVIDERS.get(settings.provider)

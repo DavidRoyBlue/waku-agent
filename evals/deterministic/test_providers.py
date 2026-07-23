@@ -44,8 +44,9 @@ def test_get_client_builds_the_right_wire(name):
 def test_missing_key_exits_with_the_key_name(name, monkeypatch):
     if not PROVIDERS[name].key_env:
         pytest.skip("subscription provider — no key to miss")
-    # pin the provider explicitly: with the real SDK installed, the keyless
-    # autodetect would otherwise reroute the anthropic case to claude-code
+    # disable the keyless autodetect: with the real SDK installed it would
+    # reroute the no-key anthropic case to claude-code instead of exiting
+    monkeypatch.setattr("waku.loop.models.sdk_ready", lambda: False)
     monkeypatch.setenv("WAKU_PROVIDER", name)
     monkeypatch.delenv(PROVIDERS[name].key_env, raising=False)
     settings = Settings(provider=name, model="", small_model="", api_key="", base_url=None)
