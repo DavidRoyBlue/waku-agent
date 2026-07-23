@@ -449,6 +449,7 @@ PRICING = {
     # (rough mid-catalog guess). ":free" ids and catalog-priced models never
     # hit this: see price_for().
     "openrouter": (1.0, 3.0),
+    "claude-code": (0.0, 0.0),   # subscription-covered — no per-token bill
 }
 
 # model id -> exact ($/M in, $/M out), filled from the live catalog fetch in
@@ -494,6 +495,11 @@ def price_for(provider: str, model: str) -> tuple[float, float]:
         return _price_cache[model]
     if model.endswith(":free"):
         return (0.0, 0.0)
+    from waku.loop.models import PROVIDERS
+
+    prov = PROVIDERS.get(provider)
+    if prov is not None and prov.kind == "sdk":
+        return (0.0, 0.0)   # subscription-covered — per-model API rates don't apply
     if model in MODEL_PRICING:
         return MODEL_PRICING[model]
     return PRICING.get(provider, (3.0, 15.0))

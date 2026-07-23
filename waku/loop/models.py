@@ -17,8 +17,10 @@ spend at all (rate-limited). The dashboard Settings tab lists the live catalog.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -56,6 +58,12 @@ PROVIDERS: dict[str, Provider] = {
                           "claude-sonnet-5", "claude-haiku-4-5-20251001",
                           catalog_url="https://api.anthropic.com/v1/models",
                           flagship="claude-opus-4-8", fast="claude-sonnet-5"),
+    # Not an API at all: the Claude Agent SDK runs the turn under your Claude
+    # subscription (claude login) — kind "sdk" routes app.py to run_sdk_loop
+    # and get_client to the thin memory client. No key env; keyless on purpose.
+    "claude-code": Provider("sdk", "", None,
+                            "claude-sonnet-5", "claude-haiku-4-5-20251001",
+                            flagship="claude-opus-4-8", fast="claude-sonnet-5"),
     # The gpt-5.6 REASONING models (luna/sol/terra) can't use function tools on
     # /v1/chat/completions (they need /v1/responses), so every Waku turn 400s on
     # them. The non-reasoning "chat" line DOES call tools fine; gpt-5.3-chat-latest
@@ -98,21 +106,64 @@ PROVIDERS: dict[str, Provider] = {
 }
 
 
+def sdk_ready() -> bool:
+    """Is the claude-agent-sdk extra importable? Shared by get_client, the
+    dashboard, and the eval gates. find_spec raises ValueError on modules
+    whose __spec__ is None (test stubs) — those ARE importable, count them."""
+    try:
+        return importlib.util.find_spec("claude_agent_sdk") is not None
+    except ValueError:
+        return True
+
+
 def get_client(settings: Settings):
     """Build the client for settings.provider and fill in default model ids.
     Returns anything with .messages.create(...) in the Anthropic shape."""
+    # Zero-config subscription: installing the [claude-code] extra IS the
+    # opt-in. Default provider, no key anywhere, SDK present -> use it.
+    if (settings.provider == "anthropic" and not os.getenv("WAKU_PROVIDER")
+            and not (settings.api_key or os.getenv("ANTHROPIC_API_KEY"))
+            and sdk_ready()):
+        print("note: no API key found but the Claude Agent SDK is installed — "
+              "running on your Claude subscription (provider claude-code). "
+              "Set WAKU_PROVIDER to choose explicitly.", file=sys.stderr)
+        settings.provider = "claude-code"
+
     provider = PROVIDERS.get(settings.provider)
     if provider is None:
         raise SystemExit(f"Unknown WAKU_PROVIDER '{settings.provider}'. "
                          f"Pick one of: {', '.join(PROVIDERS)}")
 
+    if provider.kind == "sdk":
+        settings.model = settings.model or provider.model
+        settings.small_model = settings.small_model or provider.small_model
+        try:
+            import claude_agent_sdk  # noqa: F401
+        except ImportError:
+            raise SystemExit(
+                "Provider 'claude-code' runs on the Claude Agent SDK: "
+                "uv pip install -e '.[claude-code]', install Claude Code, and "
+                "sign in once with `claude login`. It uses your Claude "
+                "subscription — no API key."
+            )
+        if os.getenv("ANTHROPIC_API_KEY"):
+            print("note: ANTHROPIC_API_KEY is set but IGNORED in claude-code "
+                  "mode — this provider always runs on your Claude subscription.",
+                  file=sys.stderr)
+        from waku.loop.sdk_agent import ClaudeAgentClient
+
+        return ClaudeAgentClient()
+
     # .strip() so a trailing newline/space from a copy-paste doesn't corrupt the
     # auth header (headers are latin-1; a stray non-ASCII char errors cryptically).
     api_key = (settings.api_key or os.getenv(provider.key_env, "")).strip()
     if not api_key:
+        hint = ("\nHave a Claude subscription instead? uv pip install -e "
+                "'.[claude-code]' and it just works — no key needed."
+                if settings.provider == "anthropic" else "")
         raise SystemExit(
             f"No API key for provider '{settings.provider}'. "
-            f"Set {provider.key_env} in .env (see .env.example)."
+            f"Set {provider.key_env} in .env (see .env.example).{hint}"
         )
     try:
         api_key.encode("latin-1")

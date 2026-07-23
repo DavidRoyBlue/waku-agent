@@ -250,3 +250,97 @@ def test_run_sdk_loop_max_turns_message_matches_waku_loop(fake_sdk):
                           messages=[{"role": "user", "content": "x"}], tools=registry,
                           max_iterations=3)
     assert "iteration limit" in result.reply
+
+
+def test_claude_code_provider_registered():
+    from waku.loop.models import PROVIDERS
+
+    provider = PROVIDERS["claude-code"]
+    assert provider.kind == "sdk"
+    assert provider.key_env == ""          # subscription login, no key env var
+    assert provider.base_url is None
+    assert provider.default_pair() == ["claude-opus-4-8", "claude-sonnet-5"]
+
+
+def test_get_client_builds_sdk_client_without_any_key(fake_sdk, monkeypatch):
+    from waku.config import Settings
+    from waku.loop.models import get_client
+    from waku.loop.sdk_agent import ClaudeAgentClient
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings = Settings(provider="claude-code", model="", small_model="",
+                        api_key="", base_url=None)
+    client = get_client(settings)
+    assert isinstance(client, ClaudeAgentClient)
+    assert settings.model == "claude-sonnet-5"
+    assert settings.small_model == "claude-haiku-4-5-20251001"
+
+
+def test_get_client_without_sdk_says_how_to_install(monkeypatch):
+    from waku.config import Settings
+    from waku.loop.models import get_client
+
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)  # import -> ImportError
+    settings = Settings(provider="claude-code", model="", small_model="",
+                        api_key="", base_url=None)
+    with pytest.raises(SystemExit, match=r"claude-code.*claude login"):
+        get_client(settings)
+
+
+def test_autodetects_subscription_when_no_key_and_sdk_installed(fake_sdk, monkeypatch):
+    """Installing the extra IS the opt-in: default provider + no key anywhere
+    + SDK importable -> claude-code, with a stderr note."""
+    from waku.config import Settings
+    from waku.loop.models import get_client
+    from waku.loop.sdk_agent import ClaudeAgentClient
+
+    monkeypatch.delenv("WAKU_PROVIDER", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings = Settings(provider="anthropic", model="", small_model="",
+                        api_key="", base_url=None)
+    assert isinstance(get_client(settings), ClaudeAgentClient)
+    assert settings.provider == "claude-code"
+
+
+def test_no_autodetect_when_a_key_or_explicit_provider_exists(fake_sdk, monkeypatch):
+    import anthropic
+    from waku.config import Settings
+    from waku.loop.models import get_client
+
+    # a key present -> the API path is untouched
+    monkeypatch.delenv("WAKU_PROVIDER", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-for-tests")
+    settings = Settings(provider="anthropic", model="", small_model="",
+                        api_key="", base_url=None)
+    assert isinstance(get_client(settings), anthropic.Anthropic)
+    assert settings.provider == "anthropic"
+
+    # an explicit WAKU_PROVIDER=anthropic without a key -> still exits, no reroute
+    monkeypatch.setenv("WAKU_PROVIDER", "anthropic")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings = Settings(provider="anthropic", model="", small_model="",
+                        api_key="", base_url=None)
+    with pytest.raises(SystemExit, match="ANTHROPIC_API_KEY"):
+        get_client(settings)
+
+
+def test_missing_anthropic_key_error_mentions_the_subscription_path(monkeypatch):
+    from waku.config import Settings
+    from waku.loop.models import get_client
+
+    monkeypatch.setenv("WAKU_PROVIDER", "anthropic")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    settings = Settings(provider="anthropic", model="", small_model="",
+                        api_key="", base_url=None)
+    with pytest.raises(SystemExit, match=r"claude-code"):
+        get_client(settings)
+
+
+def test_price_for_subscription_is_zero():
+    """price_for must short-circuit BEFORE the per-model rate table — the
+    default claude models all exist in MODEL_PRICING, and subscription turns
+    must never show dollar spend in the arena or the usage ledger."""
+    from waku.ops.dashboard import price_for
+
+    assert price_for("claude-code", "claude-sonnet-5") == (0.0, 0.0)
+    assert price_for("claude-code", "claude-opus-4-8") == (0.0, 0.0)
