@@ -34,7 +34,7 @@ reads/repeats these decisions in both English and Chinese (for the channel).
 2. **Run it against real data**, not just the PR's own fixtures — that's how the
    PR #13 bug surfaced (hardcoded `~/.waku/traces`; the real home is `.waku`
    relative to cwd via `load_settings()`).
-3. **Check it against the repo's rules** (CLAUDE.md): stdlib + anthropic/openai
+3. **Check it against the repo's rules** (AGENTS.md): stdlib + anthropic/openai
    only — new deps must sit behind an optional extra; tests land in
    `evals/deterministic/`; module + test docstrings in the teaching voice; no
    emojis in any UI surface; the arena must never touch real agent state.
